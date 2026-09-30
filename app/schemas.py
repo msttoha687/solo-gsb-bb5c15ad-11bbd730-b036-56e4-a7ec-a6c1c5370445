@@ -637,6 +637,29 @@ class TaskCreated(BaseModel):
     )
 
 
+class TaskRecoverOut(BaseModel):
+    """POST /api/tasks/recover 的接管扫描报告（服务启动时同样执行一轮）。"""
+
+    claimed: List[int] = Field(
+        default_factory=list,
+        description=(
+            "本轮被本进程领取并入队执行的未决任务号（pending 及心跳陈旧的"
+            " running 孤儿任务）；领取即按冻结请求、种子与原任务号恢复求解"
+        ),
+    )
+    already_running: List[int] = Field(
+        default_factory=list,
+        description="心跳仍新鲜、判定为仍有存活 worker 执行而本轮不介入的 running 任务号",
+    )
+    inflight: List[int] = Field(
+        default_factory=list,
+        description="已在本进程队列中或正在执行、本轮跳过的任务号",
+    )
+    claimed_count: int = Field(
+        ..., description="本轮新领取入队的任务数量（claimed 的长度，便于快速判定）"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 防篡改审计链（GET /api/tasks/{task_id}/audit）
 # --------------------------------------------------------------------------- #

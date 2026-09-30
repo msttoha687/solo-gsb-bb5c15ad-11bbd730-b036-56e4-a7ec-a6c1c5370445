@@ -20,6 +20,8 @@
 
 教研组还可对**已完成且可行**的任务**录分**（首个候选卷组，卷号从 0 起）：按 `(卷号, 考生标识, 题号)` 持久化**初评/复评**两轮整数分（0 至该题分值，仅允许该卷题目，整数与字符串题号/考生标识严格区分）。每题版本从 0 起——首次录分与缺轮补评不占版本；**改分与仲裁必须携带当前版本，成功后版本 +1，版本不符返回 409 冲突且不写入**，任何改分立即撤销旧仲裁。初评复评齐备且**相差不超过 1 分**时有效分自动取**均值**（差 1 为半分），否则等待补评或仲裁；**仲裁仅限两评分相差超过 1 分**。查询在同一快照返回逐题两评分、有效分、版本与待处理原因，**全卷每题均有有效分才返回总分**，详见下文[录分与仲裁](#录分与仲裁初评复评仲裁)。
 
+异步任务在**创建事务中即落库**，执行权不依赖进程内守护线程：服务**启动时自动接管**上一进程遗留的 `pending` 任务与心跳陈旧的 `running` 孤儿任务（按**冻结请求、种子与原任务号**恢复求解，涵盖普通、模板实例化与定向改卷任务），运行中另有守护线程周期重扫，也可调用 `POST /api/tasks/recover` 手动触发。领取走数据库条件更新 + 心跳租约，与新提交或重复启动并发时**同一任务只有一个最终结果、启用曝光配额的任务只结算一次**，租约流转与审计链在同一事务保持一致；已完成任务与已冻结成绩批次绝不重算，恢复执行异常落为可查询的 `error` 结果，详见下文[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -36,6 +38,9 @@ docker compose up --build        # 前台运行；加 -d 后台运行
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
 - 必要配置（环境变量，均有默认值，一般无需修改）：
   - `EXAM_DB_PATH`：SQLite 数据库文件路径，默认 `/data/exam.db`（已挂载为持久卷 `exam_data`，删除卷 `docker compose down -v` 会清空全部任务、模板、配额与录分数据）
+  - `EXAM_TASK_STALE_SECONDS`：running 任务心跳陈旧阈值（秒，默认 `30`）：超过该时长无心跳的任务才会在重启/扫描时被接管
+  - `EXAM_TASK_SWEEP_SECONDS`：后台未决任务接管扫描周期（秒，默认 `10`）：服务启动时总会额外立即扫描一轮
+- 容器重启或服务重新部署后，上一进程遗留的未决任务（`pending` 及心跳陈旧的 `running`）会在启动时**自动接管恢复**，无需人工干预；也可随时调用 `POST /api/tasks/recover` 手动触发，详见[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)
 - 交互式文档（Swagger）：http://localhost:8000/docs
 - 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck）
 - 查看日志：`docker compose logs -f exam-api`；停止：`docker compose down`
@@ -52,6 +57,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id`；`use_quota: true` 时启用题目曝光配额 |
+| `POST` | `/api/tasks/recover` | 手动触发一轮**未决任务接管**：领取 pending 与心跳陈旧的 running 孤儿任务并按冻结请求恢复（服务启动时也自动执行一轮；可重复调用） |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
 | `POST` | `/api/tasks/{task_id}/review-plan` | 为已完成且可行的任务生成**盲审分配**方案（同步返回，不产生新任务） |
 | `POST` | `/api/tasks/{task_id}/seat-plan` | 为已完成且含 2～5 份平行卷的可行任务生成**考场卷别排布**（同步返回，不产生新任务） |
@@ -71,7 +77,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/tasks/{task_id}/papers/{paper}/score-batches/{batch}` | 按批次查询**已冻结发布**的成绩快照（发布后改分/仲裁不改历史批次） |
 | `GET`  | `/health` | 健康检查 |
 
-任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
+任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。状态为 `done` 的任务（及其已冻结成绩批次）在任何接管扫描中都不会被重新执行；服务退出时遗留的 `pending` / `running` 任务由[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)自动收敛。
 
 ## 请求示例
 
@@ -902,6 +908,53 @@ curl -X POST http://localhost:8000/api/quotas/reclaim-expired
 
 回收后任务查询的 `quota.lease.status` 为 `reclaimed` 且 `released_at` 为释放时刻；`GET /api/quotas` 中相应题号余额已加回本次预留次数。`quota.reservations` 与 `quota_settled` 审计事件保留扣减当时的快照不变（返还动作不改写历史）。
 
+## 崩溃恢复与任务接管（`POST /api/tasks/recover`）
+
+异步任务在 `POST /api/tasks` 等创建接口的**同一事务**中落库（`tasks` 行 + `created` 事件，带租约时另有 awaiting 租约行），随后才由后台 worker 领取执行——因此**服务退出（崩溃、被 kill、容器重启）不会丢失任务**，只会留下状态为 `pending` 或 `running` 的未决行。恢复机制把执行权从“进程内守护线程”改为“数据库领取租约”：
+
+- **启动自动接管**：API 启动时立即扫描一轮，领取全部 `pending` 任务以及心跳为空或已陈旧的 `running` 任务，按记录中**冻结的请求、`seed` 与原任务号**重新求解——普通任务、模板实例化任务（冻结的 `template_id`/`version` 不回退）、定向改卷任务（冻结的 `source_request`/`source_selection`/`edits`）均覆盖。
+- **运行中周期兜底**：守护线程每 `EXAM_TASK_SWEEP_SECONDS`（默认 `10` 秒）重扫一次，无需重启即可接管后崩溃的同伴；worker 执行期间每 5 秒写一次心跳（`tasks.heartbeat_at`），心跳在 `EXAM_TASK_STALE_SECONDS`（默认 `30` 秒）内的 `running` 任务视为仍有存活 worker，**不会**被抢占。
+- **手动触发**：`POST /api/tasks/recover` 立即执行一轮扫描（幂等，可任意重复调用）。
+
+领取在单个 `BEGIN IMMEDIATE` 事务内以**条件 UPDATE** 完成（`pending` 先到先得；`running` 仅在心跳为空或陈旧时可抢占；`done` 永不命中），条件更新的行计数是跨进程、多实例重复启动、与新提交并发时的唯一裁决——**同一任务同时只有一个领取者**。任务完成结算时再次校验持有令牌（`status='running' AND claimed_by=本worker`），未持有的结果写入连同配额扣减在同一事务整体回滚，因此**任务只有一个最终结果**；启用曝光配额的任务**只结算一次**（成功扣减/余额不足/作废的租约流转均与结果、审计事件同事务提交）。接管 `running` 任务不重复追加 `started` 事件（仅当链上确无该事件时补一次），恢复任务的审计链与正常任务同样闭合。
+
+`done` 任务不参与任何接管扫描，因此**已完成任务与已冻结的成绩批次绝不重算**；冻结请求本身损坏等极端情况下，恢复仍会把任务收敛为可经 `GET /api/tasks/{task_id}` 查询的 `status=error` 结果（有 awaiting 租约时同步作废，不再永久悬置）。
+
+### 调用示例
+
+```bash
+# 服务重启后无需任何操作；也可手动触发一轮接管扫描
+curl -X POST http://localhost:8000/api/tasks/recover
+# -> 200
+# {"claimed": [12, 13],            # 本轮领取并入队恢复的未决任务号
+#  "already_running": [14],        # 心跳仍新鲜、判定为存活 worker 执行中，本轮不介入
+#  "inflight": [],                 # 已在本进程队列/执行中而跳过的任务号
+#  "claimed_count": 2}
+
+# 没有未决任务时（重复调用同样安全）：
+curl -X POST http://localhost:8000/api/tasks/recover
+# -> 200 {"claimed": [], "already_running": [], "inflight": [], "claimed_count": 0}
+
+# 接管结果通过既有的任务查询接口轮询（请求/响应约定不变）：
+curl http://localhost:8000/api/tasks/12
+# -> {"task_id": 12, "status": "done", "result": {"status": "feasible", ...}, ...}
+
+# 恢复执行异常时任务同样可查询，结果为 error：
+# -> {"task_id": 13, "status": "done",
+#     "result": {"status": "error", "error": "ValueError: ...", "traceback": "..."}}
+
+# 审计链对恢复任务保持闭合（started 不重复、配额任务恒有 quota_settled）：
+curl http://localhost:8000/api/tasks/12/audit
+# -> {"task_id": 12, "valid": true, "events": [created, started, finished, ...], ...}
+```
+
+相关环境变量（均有默认值，Compose 无需修改）：
+
+- `EXAM_TASK_STALE_SECONDS`：running 心跳陈旧阈值秒数，默认 `30`；心跳超过该时长未更新的任务才会被接管。
+- `EXAM_TASK_SWEEP_SECONDS`：后台接管扫描周期秒数，默认 `10`；启动时总会额外立即扫描一轮。
+
+> 多实例部署时让各实例共享同一 SQLite 文件即可：条件 UPDATE + `BEGIN IMMEDIATE` 保证跨实例领取互斥；新实例启动只接管无人持有的任务，不会打断其它实例正在执行的任务。
+
 ## 防篡改审计链
 
 每个异步组卷任务都附带一条**只追加、不可变**的哈希链接审计链，落库于 `task_audit_events` 表。任务生命周期与配额结算的每个关键动作都在**对应业务写入所在的现有 SQLite 事务内**追加事件——业务改动与审计事件要么同时提交、要么同时回滚：
@@ -911,9 +964,9 @@ curl -X POST http://localhost:8000/api/quotas/reclaim-expired
 | `created` | 插入 `tasks` 行（任务创建，恒为第 1 个事件） | `name`、`seed`、`request_sha256`（冻结请求文本的 SHA-256） |
 | `started` | 状态 `pending → running` | `{"status": "running"}` |
 | `finished` | 结果落库（`feasible` / `infeasible` / `error` / `quota_exceeded`） | `result_status`、`result_sha256`（结果文本的 SHA-256） |
-| `quota_settled` | **配额扣减/判定不扣减**（与扣减结果同一事务原子提交） | `outcome=reserved` 时为逐题 `items`（题号、`reserved` 扣减次数、`remaining` 扣后剩余快照）；`outcome=exceeded` 时为 `shortages` 缺额明细 |
+| `quota_settled` | **配额扣减/判定不扣减/作废**（与扣减结果同一事务原子提交） | `outcome=reserved` 时为逐题 `items`（题号、`reserved` 扣减次数、`remaining` 扣后剩余快照）；`outcome=exceeded` 时为 `shortages` 缺额明细；`outcome=void` 时为 `{"result_status": "infeasible" 或 "error"}`（无解/失败/恢复异常未扣减，租约作废） |
 
-普通任务的链为 `created → started → finished`（3 个事件）；声明 `use_quota` 的任务在 `finished` 后同事务追加 `quota_settled`（4 个事件）；任务尚未开始时只有 `created`。
+普通任务的链为 `created → started → finished`（3 个事件）；声明 `use_quota` 的任务在 `finished` 后同事务追加 `quota_settled`（4 个事件，`reserved` / `exceeded` / `void` 三种结局都恰有一条）；任务尚未开始时只有 `created`。任务被崩溃恢复接管时 `started` 事件**不重复追加**（已存在则沿用；旧进程崩在写 `started` 之前则由接管者补一条），因此恢复后链仍为同样的 3/4 个事件。
 
 ### 哈希与规范化口径
 
@@ -992,6 +1045,8 @@ curl http://localhost:8000/api/tasks/21/audit
   "hash": "…"
 }
 ```
+
+`outcome=void`（任务无解、执行失败或恢复执行异常，未产生任何预留）时第 4 个事件形如 `{"outcome": "void", "result_status": "infeasible"}`（或 `"error"`）：不写任何 `quota_reservations` 记录，带租约时租约同步置为 `void`，声明 `use_quota` 的任务因此无论成败都有且仅有一条结算事件。
 
 ### 校验结论与首个断点
 

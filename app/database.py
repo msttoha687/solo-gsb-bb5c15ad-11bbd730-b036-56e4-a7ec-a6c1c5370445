@@ -3,6 +3,16 @@
 任务状态机：pending -> running -> done（结果写入 result 列）。
 后台线程与请求线程各自建立连接，配合进程内互斥锁串行化写操作。
 
+崩溃恢复（claimed_by / heartbeat_at 列 + worker 领取租约）：任务在 create_task
+提交后即落库，执行权不依赖任何进程内线程——worker 必须先以**条件 UPDATE** 原子
+领取（claim）：pending 任务先到先得；running 任务仅当其最近心跳早于陈旧阈值
+（EXAM_TASK_STALE_SECONDS，默认 30 秒，可被 _now_iso 比较）才可被新 worker 抢占。
+领取、心跳续租、完成结算全部以 claimed_by 令牌 + 行状态做栅栏：服务重启时启动
+接管（pending 立即领取、陈旧 running 抢占），之后后台守护线程周期重扫；新提交、
+多实例/重复启动并发时同一任务只有一个领取者，最终结果也只有一个（后到者的结算
+事务因栅栏不命中而整体回滚，连配额扣减一并撤销）。领取 running 任务不重复追加
+started 事件（仅在链上确无该事件时补一次），审计链对恢复任务保持闭合。
+
 组卷模板（templates 表）：创建后不可变——只提供插入与查询，没有任何更新
 接口；修改约束配置只能通过创建新版本（同一 root_id 谱系下 version 递增）。
 
@@ -59,6 +69,10 @@ DB_PATH = os.environ.get("EXAM_DB_PATH", "/data/exam.db")
 
 _lock = threading.Lock()
 
+#: worker 领取租约的陈旧阈值（秒）：running 任务心跳超过该时长即视为执行进程已
+#: 退出，可被新的接管者抢占；pending 任务无心跳概念，任何时刻立即可领取。
+TASK_STALE_SECONDS = int(os.environ.get("EXAM_TASK_STALE_SECONDS", "30"))
+
 #: 审计链创世前驱哈希：每个任务首事件的 prev_hash 固定为 64 个 0。
 GENESIS_HASH = "0" * 64
 
@@ -84,6 +98,25 @@ def init_db() -> None:
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """
+        )
+        # 崩溃恢复领取租约（轻量迁移，旧库自动补齐）：
+        # claimed_by 为当前执行 worker 的不透明令牌（NULL=从未被领取）；
+        # heartbeat_at 为该 worker 最近一次续租心跳（UTC ISO 8601）。
+        # done 任务永不被领取，见 claim_task 的条件 UPDATE。
+        for column, decl in (
+            ("claimed_by", "TEXT"),
+            ("heartbeat_at", "TEXT"),
+        ):
+            exists = conn.execute(
+                "SELECT 1 FROM pragma_table_info('tasks') WHERE name = ?",
+                (column,),
+            ).fetchone()
+            if exists is None:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {decl}")
+        # 接管扫描只关心未决任务；部分索引避免遍历已完成任务
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_unfinished"
+            " ON tasks(status, heartbeat_at) WHERE status IN ('pending', 'running')"
         )
         conn.execute(
             """
@@ -265,42 +298,106 @@ def _new_reservation_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def update_status(task_id: int, status: str) -> None:
+def claim_task(task_id: int, worker_id: str) -> Optional[sqlite3.Row]:
+    """原子领取一个未决任务的执行权（崩溃恢复的核心栅栏）。
+
+    在**单个写事务**（进程内互斥锁 + BEGIN IMMEDIATE）内用条件 UPDATE 抢占：
+
+    - ``pending``：先到先得，置 running 并写入 worker 令牌/心跳；审计链上首次
+      流转时追加 started 事件；
+    - ``running``：仅当 heartbeat_at 为空（旧版遗留或心跳从未写入）或早于
+      陈旧阈值（原执行进程已退出）时才允许抢占，原地刷新令牌/心跳，**不重复**
+      追加 started 事件（已存在则跳过，保证 started 全链唯一）；
+    - ``done`` 或心跳仍新鲜的 running：返回 None。
+
+    跨进程、多实例重复启动及与新提交并发时，条件 UPDATE 的行计数是唯一裁决，
+    同一任务同时只有一个领取者。返回领取后的任务行（含冻结请求与种子），
+    未领到返回 None。
+    """
+    now = _now_iso()
+    stale_before = (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        - timedelta(seconds=TASK_STALE_SECONDS)
+    ).isoformat().replace("+00:00", "Z")
     with _lock, get_conn() as conn:
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-        # running 是任务生命周期唯一的状态流转点（pending -> running）
-        append_audit_event(conn, task_id, "started", {"status": status})
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, status, heartbeat_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] == "done":
+            conn.commit()
+            return None
+        if row["status"] == "running":
+            hb = row["heartbeat_at"]
+            if hb is not None and hb > stale_before:
+                # 仍有 worker 在正常续租（或在阈值宽限内）：绝不重复执行
+                conn.commit()
+                return None
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claimed_by = ?, heartbeat_at = ?"
+            " WHERE id = ? AND status IN ('pending', 'running')",
+            (worker_id, now, task_id),
+        )
+        if cur.rowcount != 1:
+            conn.commit()
+            return None
+        # started 事件全链唯一：pending -> running 首流转时追加；接管的 running
+        # 任务（或被手工置 running 的旧行）若已有该事件则补查后跳过
+        started_exists = conn.execute(
+            "SELECT 1 FROM task_audit_events WHERE task_id = ? AND event_type = 'started'",
+            (task_id,),
+        ).fetchone()
+        if started_exists is None:
+            append_audit_event(conn, task_id, "started", {"status": "running"})
+        final = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        conn.commit()
+        return final
 
 
-def finish_task(
-    task_id: int,
-    result_json: str,
-    void_lease: bool = False,
-) -> None:
+def heartbeat(worker_id: str) -> int:
+    """为本 worker 当前持有的全部 running 任务续租心跳，返回刷新行数。
+
+    只刷新 claimed_by 仍指向自己的行；任务若已被栅栏判定结束（done）或被人工
+    改动则不再命中。心跳保证存活 worker 执行长耗时求解时任务不会被误判陈旧。
+    """
+    now = _now_iso()
     with _lock, get_conn() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
-            (result_json, task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET heartbeat_at = ?"
+            " WHERE claimed_by = ? AND status = 'running'",
+            (now, worker_id),
         )
-        # 带租约的配额任务最终未走扣减结算（无解/失败）：租约在同事务作废，
-        # 任何持 token 的确认请求都不可能再得到配额
-        if void_lease:
-            conn.execute(
-                "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
-                " AND status = 'awaiting'",
-                (task_id,),
-            )
-        # feasible / infeasible / error 统一记为 finished，成败以 payload.status 区分；
-        # 事件与任务结果落库原子提交，载荷冻结结果摘要
-        append_audit_event(
-            conn,
-            task_id,
-            "finished",
-            {
-                "result_status": json.loads(result_json).get("status"),
-                "result_sha256": _sha256_text(result_json),
-            },
-        )
+        return cur.rowcount
+
+
+def list_recoverable_tasks() -> List[sqlite3.Row]:
+    """列出需要接管的未决任务：全部 pending，以及心跳为空或已陈旧的 running。
+
+    心跳仍在宽限窗口内的 running 任务视为仍有存活 worker 执行，本次不接管。
+    done 任务永不出现（接管不重算已完成任务）。
+    """
+    stale_before = (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        - timedelta(seconds=TASK_STALE_SECONDS)
+    ).isoformat().replace("+00:00", "Z")
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, status FROM tasks WHERE status = 'pending'"
+            " OR (status = 'running' AND"
+            "     (heartbeat_at IS NULL OR heartbeat_at <= ?))"
+            " ORDER BY id",
+            (stale_before,),
+        ).fetchall()
+
+
+def list_active_running_tasks() -> List[sqlite3.Row]:
+    """列出全部 running 任务（不区分心跳新旧），供接管接口报告状态。"""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, status, claimed_by, heartbeat_at FROM tasks"
+            " WHERE status = 'running' ORDER BY id"
+        ).fetchall()
 
 
 def get_task(task_id: int) -> Optional[sqlite3.Row]:
@@ -737,10 +834,31 @@ def _verify_quota_settlement(
                 "expected": payload.get("shortages"),
                 "actual": result.get("shortages"),
             }
+    elif outcome == "void":
+        # 未扣减（无解/失败/恢复异常）：不得存在预留记录，结果不得可行，
+        # 载荷冻结的 result_status 须与实际结果状态一致
+        if actual_items:
+            return {
+                "kind": "reservations_mismatch",
+                "expected": [],
+                "actual": actual_items,
+            }
+        if result.get("status") in ("feasible", "quota_exceeded"):
+            return {
+                "kind": "settlement_outcome_mismatch",
+                "expected": "non-feasible result for void settlement",
+                "actual": result.get("status"),
+            }
+        if payload.get("result_status") != result.get("status"):
+            return {
+                "kind": "result_status_mismatch",
+                "expected": payload.get("result_status"),
+                "actual": result.get("status"),
+            }
     else:
         return {
             "kind": "invalid_payload",
-            "expected": "outcome in ('reserved', 'exceeded')",
+            "expected": "outcome in ('reserved', 'exceeded', 'void')",
             "actual": outcome,
         }
     return None
@@ -832,96 +950,118 @@ def get_quota_reservations(task_id: int) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def finish_task_with_quota(
-    task_id: int, result: Dict[str, Any], requirements: List[Tuple[Any, int]]
-) -> Dict[str, Any]:
-    """启用配额的任务落库：校验 -> 原子扣减 -> 完成任务 -> 追加审计事件。
+def settle_task(
+    task_id: int,
+    worker_id: str,
+    result: Dict[str, Any],
+    requirements: Optional[List[Tuple[Any, int]]] = None,
+) -> Optional[str]:
+    """worker 完成任务后的**唯一结算入口**：结果落库 + 可选配额扣减，全程单事务。
 
-    扣减、任务结果更新与 finished / quota_settled 两个审计事件全部在**单个
-    SQLite 事务**中，提交则同时生效、回滚则同时消失：配额结算事件绝不与扣减
-    结果出现半成功状态。
+    结算前先以 ``status='running' AND claimed_by=worker_id`` 栅栏确认本 worker
+    仍是持有者：栅栏不命中（任务已被他人结算或被接管）时整体回滚、不写任何
+    内容并返回 None——恢复与新提交、多实例重复启动并发时，**同一任务只有一个
+    最终结果**，启用配额的任务也**只结算一次**。成功返回最终落库结果的状态
+    （feasible / infeasible / error / quota_exceeded）。
 
-    requirements 为 (题号, 需扣减次数) 列表。进程内互斥锁 + BEGIN IMMEDIATE
-    保证并发任务的校验-扣减严格串行：
-    - 全部题余额充足：逐题扣减、写入预留记录（remaining 为扣后快照），
-      任务以原可行结果完成，结算事件 outcome=reserved 并冻结逐题扣减/剩余快照；
-    - 任一题余额不足（无配额记录按 0 计）：整组不扣减，任务结果改写为
-      quota_exceeded 并附缺额明细，结算事件 outcome=exceeded 并冻结缺额明细。
-    返回最终落库的 result。
+    - 非配额任务：直接以 result 完成，finished 事件与结果原子提交；
+    - 配额任务且 result 可行（requirements 为逐题需求）：校验 -> 原子扣减 ->
+      完成任务 -> finished + quota_settled(reserved) 同事务；任一题余额不足则
+      整组不扣减、结果改写为 quota_exceeded，租约作废，记 quota_settled(exceeded)；
+    - 配额任务但结果非可行（infeasible / error，含恢复执行异常）：不扣任何配额，
+      租约在同事务置 void，并追加 **quota_settled(void)** 事件闭合审计链——
+      声明 use_quota 的任务无论成败都恰有一条结算事件，与业务表交叉一致。
     """
     with _lock, get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        keys = [(_qkey(qid), qid, int(need)) for qid, need in requirements]
-        rows = (
-            conn.execute(
-                "SELECT question_id, quota FROM quotas WHERE question_id IN"
-                f" ({','.join('?' for _ in keys)})",
-                [k for k, _, _ in keys],
-            ).fetchall()
-            if keys
-            else []
-        )
-        balance = {r["question_id"]: int(r["quota"]) for r in rows}
+        owner = conn.execute(
+            "SELECT status, claimed_by FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if owner is None or owner["status"] != "running" or owner["claimed_by"] != worker_id:
+            # 本 worker 已不是持有者（任务被接管/已结算）：放弃，绝不写第二份结果
+            conn.rollback()
+            return None
 
-        shortages = []
-        for key, qid, need in keys:
-            available = balance.get(key, 0)
-            if available < need:
-                shortages.append(
-                    {
-                        "question_id": qid,
-                        "required": need,
-                        "available": available,
-                        "shortage": need - available,
-                    }
-                )
+        req_row = conn.execute(
+            "SELECT request FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        try:
+            use_quota = bool(json.loads(req_row["request"]).get("use_quota"))
+        except (ValueError, TypeError):
+            use_quota = False
 
-        if shortages:
-            final = {
-                "status": "quota_exceeded",
-                "message": "题目曝光配额不足，本次组卷未扣减任何配额",
-                "shortages": shortages,
-            }
-        else:
-            settled_items = []
+        settled_items: List[Dict[str, Any]] = []
+        shortages: List[Dict[str, Any]] = []
+        if use_quota and result.get("status") == "feasible" and requirements:
+            keys = [(_qkey(qid), qid, int(need)) for qid, need in requirements]
+            rows = (
+                conn.execute(
+                    "SELECT question_id, quota FROM quotas WHERE question_id IN"
+                    f" ({','.join('?' for _ in keys)})",
+                    [k for k, _, _ in keys],
+                ).fetchall()
+                if keys
+                else []
+            )
+            balance = {r["question_id"]: int(r["quota"]) for r in rows}
             for key, qid, need in keys:
-                remaining = balance[key] - need
-                conn.execute(
-                    "UPDATE quotas SET quota = ?, updated_at = datetime('now')"
-                    " WHERE question_id = ?",
-                    (remaining, key),
-                )
-                conn.execute(
-                    "INSERT INTO quota_reservations"
-                    " (task_id, question_id, reserved, remaining)"
-                    " VALUES (?, ?, ?, ?)",
-                    (task_id, key, need, remaining),
-                )
-                settled_items.append(
-                    {"question_id": qid, "reserved": need, "remaining": remaining}
-                )
+                available = balance.get(key, 0)
+                if available < need:
+                    shortages.append(
+                        {
+                            "question_id": qid,
+                            "required": need,
+                            "available": available,
+                            "shortage": need - available,
+                        }
+                    )
+            if shortages:
+                final = {
+                    "status": "quota_exceeded",
+                    "message": "题目曝光配额不足，本次组卷未扣减任何配额",
+                    "shortages": shortages,
+                }
+            else:
+                for key, qid, need in keys:
+                    remaining = balance[key] - need
+                    conn.execute(
+                        "UPDATE quotas SET quota = ?, updated_at = datetime('now')"
+                        " WHERE question_id = ?",
+                        (remaining, key),
+                    )
+                    conn.execute(
+                        "INSERT INTO quota_reservations"
+                        " (task_id, question_id, reserved, remaining)"
+                        " VALUES (?, ?, ?, ?)",
+                        (task_id, key, need, remaining),
+                    )
+                    settled_items.append(
+                        {"question_id": qid, "reserved": need, "remaining": remaining}
+                    )
+                final = result
+        else:
             final = result
 
         final_json = json.dumps(final, ensure_ascii=False)
-        conn.execute(
-            "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
-            (final_json, task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?"
+            " WHERE id = ? AND status = 'running' AND claimed_by = ?",
+            (final_json, task_id, worker_id),
         )
+        if cur.rowcount != 1:
+            # 双保险：事务内并发竞态下持有者被改写则整体放弃
+            conn.rollback()
+            return None
+
         # 预留租约与扣减结果在同一事务流转，杜绝“已扣减但租约未生效”的中间态：
-        # 成功扣减则激活租约（reserved，expires_at = 当前 UTC + lease_seconds），
-        # 配额不足则租约作废（void）；未声明租约的任务无此行，语句不命中任何行
+        # 成功扣减则激活租约（reserved，expires_at = 当前 UTC + lease_seconds）；
+        # 配额不足 / 无解 / 失败 / 恢复异常则租约作废（void）。
         lease_row = conn.execute(
             "SELECT lease_seconds FROM quota_leases WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if lease_row is not None:
-            if shortages:
-                conn.execute(
-                    "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
-                    " AND status = 'awaiting'",
-                    (task_id,),
-                )
-            else:
+            if final.get("status") == "feasible" and not shortages:
                 expires_at = (
                     datetime.now(timezone.utc).replace(microsecond=0)
                     + timedelta(seconds=int(lease_row["lease_seconds"]))
@@ -931,7 +1071,14 @@ def finish_task_with_quota(
                     " WHERE task_id = ? AND status = 'awaiting'",
                     (expires_at, task_id),
                 )
-        # finished：冻结任务最终结果摘要（含 quota_exceeded）
+            else:
+                conn.execute(
+                    "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
+                    " AND status = 'awaiting'",
+                    (task_id,),
+                )
+
+        # finished：冻结任务最终结果摘要（含 quota_exceeded / error）
         append_audit_event(
             conn,
             task_id,
@@ -941,22 +1088,73 @@ def finish_task_with_quota(
                 "result_sha256": _sha256_text(final_json),
             },
         )
-        # quota_settled：与上面的扣减/未扣减结果同一事务原子提交
-        if shortages:
-            append_audit_event(
-                conn,
-                task_id,
-                "quota_settled",
-                {"outcome": "exceeded", "shortages": shortages},
-            )
-        else:
-            append_audit_event(
-                conn,
-                task_id,
-                "quota_settled",
-                {"outcome": "reserved", "items": settled_items},
-            )
-    return final
+        # quota_settled：仅声明 use_quota 的任务追加，且与结果/扣减同一事务。
+        # reserved=已扣减（逐题快照）；exceeded=余额不足未扣减（缺额明细）；
+        # void=无解/失败/恢复异常，未产生预留——审计链对配额任务恒闭合。
+        if use_quota:
+            if final.get("status") == "feasible":
+                append_audit_event(
+                    conn,
+                    task_id,
+                    "quota_settled",
+                    {"outcome": "reserved", "items": settled_items},
+                )
+            elif shortages:
+                append_audit_event(
+                    conn,
+                    task_id,
+                    "quota_settled",
+                    {"outcome": "exceeded", "shortages": shortages},
+                )
+            else:
+                append_audit_event(
+                    conn,
+                    task_id,
+                    "quota_settled",
+                    {"outcome": "void", "result_status": final.get("status")},
+                )
+        conn.commit()
+        return str(final.get("status"))
+
+
+def settle_task_error_fallback(task_id: int, worker_id: str) -> bool:
+    """极端兜底：连冻结请求都无法读取/解析时，仍把任务收敛为可查询的错误结果。
+
+    不依赖请求内容（不判断 use_quota、不追加 quota_settled），仅在本 worker
+    仍持有时把任务置 done 并写 error 结果 + finished 事件；若存在 awaiting 租约
+    一并作废，避免其永久悬置。返回是否成功收敛。
+    """
+    result = {
+        "status": "error",
+        "error": "RecoverError: 冻结请求损坏或缺失，无法恢复执行",
+    }
+    result_json = json.dumps(result, ensure_ascii=False)
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?"
+            " WHERE id = ? AND status = 'running' AND claimed_by = ?",
+            (result_json, task_id, worker_id),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE quota_leases SET status = 'void' WHERE task_id = ?"
+            " AND status = 'awaiting'",
+            (task_id,),
+        )
+        append_audit_event(
+            conn,
+            task_id,
+            "finished",
+            {
+                "result_status": "error",
+                "result_sha256": _sha256_text(result_json),
+            },
+        )
+        conn.commit()
+        return True
 
 
 # --------------------------------------------------------------------------- #

@@ -37,6 +37,7 @@ from .schemas import (
     TaskAuditOut,
     TaskCreated,
     TaskQuotaOut,
+    TaskRecoverOut,
     TaskResult,
     TaskStatus,
     TemplateConfig,
@@ -46,12 +47,17 @@ from .schemas import (
     TemplateTaskIn,
 )
 from .seat_plan import solve_seat_plan
-from .worker import submit
+from .worker import recover_once, startup_recover, submit
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    # 服务启动即接管上一进程遗留的未决任务（pending 立即领取、心跳陈旧的
+    # running 抢占重跑）；守护线程之后还会周期重扫，无需等待重启即可兜底。
+    report = startup_recover()
+    if report["claimed"]:
+        print(f"[startup] recovered unfinished tasks: {report['claimed']}", flush=True)
     yield
 
 
@@ -68,7 +74,7 @@ app = FastAPI(
         "，以及面向已完成可行任务首个候选卷组的成绩批次发布"
         "（单事务快照一次性冻结全批逐题有效分与总分）"
     ),
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
@@ -176,6 +182,29 @@ def create_task(payload: ExamTaskIn) -> TaskCreated:
         lease_seconds=payload.lease_seconds,
         reservation_token=reservation_token,
     )
+
+
+@app.post("/api/tasks/recover", response_model=TaskRecoverOut)
+def recover_tasks() -> TaskRecoverOut:
+    """手动触发一轮对**未决任务**的接管（服务启动时也会自动执行一轮）。
+
+    扫描全部 ``pending`` 任务以及心跳为空/已陈旧的 ``running`` 任务（执行
+    进程退出后的孤儿），原子领取后按**冻结请求、种子与原任务号**在后台重新
+    求解，涵盖普通任务、模板实例化任务与定向改卷任务。心跳仍新鲜的
+    ``running`` 任务视为仍有存活 worker，本次不介入；``done`` 任务永不重算，
+    已冻结的成绩批次也不受影响。
+
+    并发安全：领取走数据库条件 UPDATE，与新提交、其它实例或重复启动并发时
+    同一任务只有一个领取者；完成结算再次校验持有令牌，未持有的结果连同配额
+    扣减整体回滚——**任务只有一个最终结果，启用曝光配额的任务只结算一次**，
+    租约流转与审计事件在同一事务内保持一致。恢复执行抛异常时任务落为可查询
+    的 ``status=error`` 结果。
+
+    本接口可安全重复调用（幂等扫描）：无未决任务时 ``claimed`` 为空数组。
+    接管结果请通过 ``GET /api/tasks/{task_id}`` 轮询，审计链见
+    ``GET /api/tasks/{task_id}/audit``。
+    """
+    return TaskRecoverOut(**recover_once())
 
 
 # --------------------------------------------------------------------------- #
@@ -514,10 +543,22 @@ def get_task(task_id: int) -> TaskStatus:
 
     result: Optional[TaskResult] = None
     if row["result"]:
-        result = TaskResult(**json.loads(row["result"]))
+        # 结果由本服务写入，正常必可解析；离线损坏时退化为不展示结果而非 500，
+        # 保证恢复落库的 error 结果等状态始终可查询
+        try:
+            result = TaskResult(**json.loads(row["result"]))
+        except (ValueError, TypeError):
+            result = None
 
+    # 冻结请求正常必为合法 JSON；恢复兜底场景（请求损坏）下退化为空对象，
+    # 使状态/错误结果仍可经本接口查询
+    try:
+        req = json.loads(row["request"])
+        if not isinstance(req, dict):
+            req = {}
+    except (ValueError, TypeError):
+        req = {}
     source_task_id: Optional[int] = None
-    req = json.loads(row["request"])
     if req.get("kind") == "revise":
         source_task_id = req.get("source_task_id")
 
