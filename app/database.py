@@ -265,23 +265,88 @@ def _new_reservation_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def update_status(task_id: int, status: str) -> None:
+def claim_task(task_id: int) -> str:
+    """原子抢占一个待执行任务的执行权（供新提交与崩溃恢复共用）。
+
+    在**单个事务**（进程内互斥锁 + BEGIN IMMEDIATE）内按状态条件把任务置为
+    running，条件 UPDATE 的行计数是唯一裁决：
+
+    - ``claimed_pending``：原状态为 pending，置 running 并在**同一事务**补记
+      started 审计事件（pending -> running 与事件原子提交，崩溃也不丢事件）；
+    - ``claimed_running``：原状态为 running——典型为服务退出时正在求解、结果
+      尚未落库的悬置任务。started 事件在首次开始时已落库，恢复只抢占执行权、
+      重新求解，**绝不重复记 started**（异常缺失时才补记且仅补一次）；
+    - ``stale``：任务不存在、已 done 或已被其他执行者/实例抢占——调用方必须
+      直接退出，从而保证恢复与新提交、重复启动并发时一个任务只有一个最终结果。
+    """
     with _lock, get_conn() as conn:
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-        # running 是任务生命周期唯一的状态流转点（pending -> running）
-        append_audit_event(conn, task_id, "started", {"status": status})
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] not in ("pending", "running"):
+            conn.commit()
+            return "stale"
+        previous = row["status"]
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?"
+            " AND status IN ('pending', 'running')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            # 并发抢占失败：其他执行者已先一步接管/完成
+            conn.commit()
+            return "stale"
+        has_started = conn.execute(
+            "SELECT 1 FROM task_audit_events WHERE task_id = ?"
+            " AND event_type = 'started' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if not has_started:
+            # pending 首次开始；或遗留 running 异常缺失 started（仅补一次，
+            # 审计链仍为 created -> started -> finished）
+            append_audit_event(conn, task_id, "started", {"status": "running"})
+        conn.commit()
+        return "claimed_pending" if previous == "pending" else "claimed_running"
+
+
+def list_unfinished_tasks() -> List[int]:
+    """列出所有未完成任务（pending 或服务退出时悬置的 running），按 ID 升序。
+
+    done 任务（结果已落库，含已冻结成绩批次所属任务）一律不在其中，恢复永不重算。
+    """
+    with get_conn() as conn:
+        return [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id FROM tasks WHERE status IN ('pending', 'running')"
+                " ORDER BY id"
+            ).fetchall()
+        ]
 
 
 def finish_task(
     task_id: int,
     result_json: str,
     void_lease: bool = False,
-) -> None:
+) -> bool:
+    """落库任务最终结果。仅当前为 running 的任务可被完成（条件 UPDATE 裁决）。
+
+    返回 True 表示本次调用完成了任务；False 表示任务不存在或已不是 running
+    （已完成/已被其他执行者落库）——此时调用方不得再写结果或追加审计事件，
+    保证一个任务只有一个最终结果。审计 finished 事件与结果更新、租约作废在
+    **同一事务**原子提交。
+    """
     with _lock, get_conn() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?"
+            " WHERE id = ? AND status = 'running'",
             (result_json, task_id),
         )
+        if cur.rowcount != 1:
+            conn.commit()
+            return False
         # 带租约的配额任务最终未走扣减结算（无解/失败）：租约在同事务作废，
         # 任何持 token 的确认请求都不可能再得到配额
         if void_lease:
@@ -301,6 +366,8 @@ def finish_task(
                 "result_sha256": _sha256_text(result_json),
             },
         )
+        conn.commit()
+        return True
 
 
 def get_task(task_id: int) -> Optional[sqlite3.Row]:
@@ -834,12 +901,14 @@ def get_quota_reservations(task_id: int) -> List[sqlite3.Row]:
 
 def finish_task_with_quota(
     task_id: int, result: Dict[str, Any], requirements: List[Tuple[Any, int]]
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """启用配额的任务落库：校验 -> 原子扣减 -> 完成任务 -> 追加审计事件。
 
     扣减、任务结果更新与 finished / quota_settled 两个审计事件全部在**单个
     SQLite 事务**中，提交则同时生效、回滚则同时消失：配额结算事件绝不与扣减
-    结果出现半成功状态。
+    结果出现半成功状态。仅**当前为 running 且本执行者已抢占**的任务可结算；
+    任务不存在或已 done 时直接返回 None、绝不触碰配额——配合 claim_task 的
+    条件抢占，恢复与新提交/重复启动并发时同一任务的配额**只结算一次**。
 
     requirements 为 (题号, 需扣减次数) 列表。进程内互斥锁 + BEGIN IMMEDIATE
     保证并发任务的校验-扣减严格串行：
@@ -847,10 +916,17 @@ def finish_task_with_quota(
       任务以原可行结果完成，结算事件 outcome=reserved 并冻结逐题扣减/剩余快照；
     - 任一题余额不足（无配额记录按 0 计）：整组不扣减，任务结果改写为
       quota_exceeded 并附缺额明细，结算事件 outcome=exceeded 并冻结缺额明细。
-    返回最终落库的 result。
+    返回最终落库的 result；任务已无权结算（不存在/已完成）时返回 None。
     """
     with _lock, get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if owner is None or owner["status"] != "running":
+            # 已被其他执行者完成或任务不存在：不得扣减任何配额、不得追加事件
+            conn.commit()
+            return None
         keys = [(_qkey(qid), qid, int(need)) for qid, need in requirements]
         rows = (
             conn.execute(
@@ -903,10 +979,15 @@ def finish_task_with_quota(
             final = result
 
         final_json = json.dumps(final, ensure_ascii=False)
-        conn.execute(
-            "UPDATE tasks SET status = 'done', result = ? WHERE id = ?",
+        cur_done = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?"
+            " WHERE id = ? AND status = 'running'",
             (final_json, task_id),
         )
+        if cur_done.rowcount != 1:
+            # 进入本事务后被其他执行者抢先完成：整事务回滚，配额不扣、事件不追加
+            conn.rollback()
+            return None
         # 预留租约与扣减结果在同一事务流转，杜绝“已扣减但租约未生效”的中间态：
         # 成功扣减则激活租约（reserved，expires_at = 当前 UTC + lease_seconds），
         # 配额不足则租约作废（void）；未声明租约的任务无此行，语句不命中任何行
@@ -956,6 +1037,7 @@ def finish_task_with_quota(
                 "quota_settled",
                 {"outcome": "reserved", "items": settled_items},
             )
+        conn.commit()
     return final
 
 

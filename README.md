@@ -30,7 +30,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化；随后**自动接管上轮退出时悬置（pending/running）的组卷任务**（见[崩溃恢复](#崩溃恢复启动自动接管悬置任务)）。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -52,6 +52,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id`；`use_quota: true` 时启用题目曝光配额 |
+| `POST` | `/api/tasks/recover` | **手动接管**所有 `pending`/`running` 悬置任务（服务启动时已自动执行一次；幂等） |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
 | `POST` | `/api/tasks/{task_id}/review-plan` | 为已完成且可行的任务生成**盲审分配**方案（同步返回，不产生新任务） |
 | `POST` | `/api/tasks/{task_id}/seat-plan` | 为已完成且含 2～5 份平行卷的可行任务生成**考场卷别排布**（同步返回，不产生新任务） |
@@ -72,6 +73,64 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
+
+## 崩溃恢复（启动自动接管悬置任务）
+
+异步任务在创建时即把**冻结请求、种子与原任务号**落库（`tasks` 表），但求解此前仅由进程内守护线程执行——服务在任务 `pending` 或 `running` 期间退出，任务会永久悬置。现在**服务启动时自动接管**这些任务，无需任何手动初始化：
+
+- **接管范围**：所有状态为 `pending`（已落库、未开始）与 `running`（上次退出时正在求解、结果尚未落库）的任务，按任务号升序重新排队，在后台串行求解；**普通任务、模板实例化任务、定向改卷任务一视同仁**（改卷任务的冻结请求内自带源请求与逐卷编辑条件，恢复无需依赖源任务仍在内存）。
+- **不重算**：状态为 `done` 的任务（结果已落库）一律跳过——已完成的组卷以及已冻结发布的成绩批次所属任务**绝不重算**，历史结果与批次快照保持不变。
+- **唯一最终结果**：接管与新提交、或服务被**重复启动/多实例并发**时，执行权由数据库内**条件状态抢占**（`pending`/`running → running`，`BEGIN IMMEDIATE` + 行计数裁决）获得，结果落库同样带 `status='running'` 条件——同一任务只有一个执行者能写入终态，**只能有一个最终结果**；重复求解得到的另一份结果被整体丢弃。
+- **配额只结算一次**：启用曝光配额的任务，扣减与任务终态、`quota_settled` 审计事件在同一事务提交；抢占失败或任务已 `done` 时整事务回滚，**配额不扣、事件不追加**。租约流转（`awaiting → reserved/void → confirmed/reclaimed`）与审计链保持一致，恢复不会把同一配额释放或重扣两次。
+- **审计链一致**：`pending` 任务在接管事务内补记唯一的 `started` 事件；遗留 `running` 任务的 `started` 在首次开始时已落库，恢复**不重复记录**，链仍为 `created → started → finished`（配额任务再加 `quota_settled`）。
+- **异常可查询**：恢复执行时求解或落库环节抛出的任何异常，都转成 `status="error"` 的终态结果（含 `error` 与 `traceback`）落库并经 `GET /api/tasks/{task_id}` 可查，任务不会再次悬置；冻结请求本身损坏时同样给出 `error` 终态。
+
+启动后可在日志看到接管情况，例如 `启动恢复：接管 2 个悬置任务 [3, 7]`；没有悬置任务时不输出。Compose 场景下 `docker compose up` / 容器因 `restart: unless-stopped` 重启都会自动触发，数据卷 `exam_data` 中的任务记录不丢。
+
+### 手动触发恢复（`POST /api/tasks/recover`）
+
+不想重启服务时，可显式触发同一恢复流程（也适合放在运维巡检里周期确认）。**接口幂等**：已完成、或本进程已在执行的任务不会再次排队，因此正常情况下重复调用返回 `recovered_count: 0`。
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/recover
+```
+
+启动时存在 `pending`/`running` 任务（例如任务 3、7）时：
+
+```json
+{"recovered_count": 2, "task_ids": [3, 7]}
+```
+
+全部任务已完成（或已在执行）时：
+
+```json
+{"recovered_count": 0, "task_ids": []}
+```
+
+返回仅表示“已重新排队接管”；各任务的最终状态与结果仍按既有约定通过 `GET /api/tasks/{task_id}` 轮询获取（创建、任务查询、配额确认与回收的请求/响应结构均未改变）。
+
+### 恢复用法示例（重启后确认接管结果）
+
+```bash
+# 1) 服务重启（或容器重启）后，查看是否接管了悬置任务
+docker compose logs exam-api | grep 启动恢复
+#    -> 启动恢复：接管 2 个悬置任务 [3, 7]
+
+# 2) 轮询原任务号——任务号、种子与冻结请求均不变，结果与未重启时一致
+curl http://localhost:8000/api/tasks/7
+#    -> {"task_id": 7, "status": "done", "seed": 42,
+#        "result": {"status": "feasible", "selected_ids": [/* … */]}}
+
+# 3) 校验审计链：started 仅一个、配额任务仅有一次 quota_settled
+curl http://localhost:8000/api/tasks/7/audit
+#    -> {"valid": true, "events": [created, started, finished(, quota_settled)]}
+
+# 4) 不重启也可手动触发（幂等）；已无悬置任务时返回 0
+curl -X POST http://localhost:8000/api/tasks/recover
+#    -> {"recovered_count": 0, "task_ids": []}
+```
+
+> 配额租约任务在服务停机期间可能已过 `expires_at`：恢复只负责把任务求解并结算（未结算的租约在结算成功时按当时刻激活，无解/失败则作废）；**已结算预留的返还仍只由 `POST /api/quotas/reclaim-expired` 完成**，恢复不自动返还、不重扣，语义与既有约定完全一致。
 
 ## 请求示例
 

@@ -637,6 +637,21 @@ class TaskCreated(BaseModel):
     )
 
 
+class TaskRecoveryOut(BaseModel):
+    """崩溃恢复（启动自动接管 / 手动触发）的执行结果。"""
+
+    recovered_count: int = Field(
+        ..., description="本次实际重新接管并排队的 pending/running 任务数"
+    )
+    task_ids: List[int] = Field(
+        ...,
+        description=(
+            "本次接管的任务号（按任务号升序）；已完成、已在执行或不存在的"
+            "任务不会重复接管，因此重复调用幂等（可能返回空列表）"
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 防篡改审计链（GET /api/tasks/{task_id}/audit）
 # --------------------------------------------------------------------------- #

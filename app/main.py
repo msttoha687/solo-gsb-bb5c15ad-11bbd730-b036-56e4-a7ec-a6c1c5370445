@@ -37,6 +37,7 @@ from .schemas import (
     TaskAuditOut,
     TaskCreated,
     TaskQuotaOut,
+    TaskRecoveryOut,
     TaskResult,
     TaskStatus,
     TemplateConfig,
@@ -46,12 +47,17 @@ from .schemas import (
     TemplateTaskIn,
 )
 from .seat_plan import solve_seat_plan
-from .worker import submit
+from .worker import recover_pending, submit
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    # 服务启动后自动接管此前已落库但悬置（pending / running）的异步任务：
+    # 按冻结请求、种子与原任务号重新抢占求解，done 任务不重算。
+    # 与新提交、重复启动并发时由 claim_task 的条件抢占保证一个任务只有一个
+    # 最终结果；此处不阻塞启动，任务在后台守护线程内串行恢复。
+    recover_pending()
     yield
 
 
@@ -67,8 +73,9 @@ app = FastAPI(
         "，以及面向已完成可行任务首个候选卷组的双评录分与仲裁"
         "，以及面向已完成可行任务首个候选卷组的成绩批次发布"
         "（单事务快照一次性冻结全批逐题有效分与总分）"
+        "；服务启动自动接管 pending/running 悬置任务（崩溃恢复，幂等可手动触发）"
     ),
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
@@ -176,6 +183,28 @@ def create_task(payload: ExamTaskIn) -> TaskCreated:
         lease_seconds=payload.lease_seconds,
         reservation_token=reservation_token,
     )
+
+
+@app.post("/api/tasks/recover", response_model=TaskRecoveryOut)
+def recover_tasks() -> TaskRecoveryOut:
+    """手动接管所有悬置（pending / running）的异步任务。
+
+    服务**启动时已自动执行同一恢复**；此接口供不想重启服务时显式触发，或在
+    运维流程中周期性确认。恢复按任务冻结的请求、种子与原任务号重新抢占求解，
+    涵盖普通、模板实例化与定向改卷任务：
+
+    - 仅接管状态为 pending 与 running 的任务；已 done 的任务（结果已落库，
+      含已冻结成绩批次所属任务）一律不重算；
+    - 接管与新提交、重复/并发调用由条件状态抢占（pending/running -> running，
+      行计数裁决）与落库条件保证：同一任务只有一个执行者、**只有一个最终
+      结果**，启用配额的任务**只结算一次**，租约流转与审计链保持一致；
+    - 恢复执行中的任何异常都形成可经 ``GET /api/tasks/{task_id}`` 查询的
+      ``error`` 结果，任务不会再悬置；
+    - 接口幂等：重复调用时已完成或本进程已在执行的任务不会再次排队，
+      ``recovered_count`` 可能为 0。
+    """
+    recovered = recover_pending()
+    return TaskRecoveryOut(recovered_count=len(recovered), task_ids=recovered)
 
 
 # --------------------------------------------------------------------------- #
